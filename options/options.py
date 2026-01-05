@@ -46,8 +46,10 @@ class Options():
         parser.add_argument('--FAFormer_head', type=int, default=2)
         parser.add_argument('--use_probeformer', action='store_true', default=False,
                             help='Use ProbeFormer instead of FAFormer (default: False)')
-        parser.add_argument('--num_probes', type=int, default=8,
+        parser.add_argument('--num_probes', type=int, default=4,
                             help='Number of probes for ProbeFormer mechanism')
+        parser.add_argument('--diversity_weight', type=float, default=0.1,
+                            help='Weight for diversity loss')
 
         # evaluation setting
         parser.add_argument('--eval_stage', type=int, default=1,

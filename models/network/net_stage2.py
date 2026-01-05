@@ -100,6 +100,7 @@ class net_stage2(nn.Module):
         super(net_stage2, self).__init__()
 
         self.use_probeformer = getattr(opt, 'use_probeformer', False)
+        self.diversity_weight = getattr(opt, 'diversity_weight', 0.1)
 
         self.backbone = net_stage1()
         if train:
@@ -116,10 +117,11 @@ class net_stage2(nn.Module):
         # print(params)
 
         if self.use_probeformer:
-            print(f"Using ProbeFormer with {opt.num_probes} probes")
+            num_probes = getattr(opt, 'num_probes', 4)
+            print(f"Using ProbeFormer with {num_probes} probes")
             self.transformer = ProbeFormer(dim, layers=opt.FAFormer_layers, heads=opt.FAFormer_head,
                                             reduction_factor=opt.FAFormer_reduction_factor,
-                                            num_probes=opt.num_probes)
+                                            num_probes=num_probes)
             self.cls_token = None  # Not used in ProbeFormer
         else:
             print("Using FAFormer with CLS token")
@@ -164,29 +166,34 @@ class net_stage2(nn.Module):
         _, cls_tokens, _ = self.backbone(x)
 
         # Each cls_tokens[i] is [L, B, D] (LND format, L=257: 256 patches + 1 CLS)
-        # Extract CLS token (index 0 in sequence): [L, B, D] -> [B, D]
+        # Extract CLS token only
         cls_tokens = [t[0, :, :] for t in cls_tokens]
-
         # Stack: [24, B, D]
         x = torch.stack(cls_tokens, dim=0)
 
         if self.use_probeformer:
-            # ProbeFormer: x is already [24, B, D] in LND format
-            x = self.transformer(x)
+            # ProbeFormer: x is in LND format
+            probes = self.transformer(x)  # [num_probes, B, D]
             # Mean Pooling over probes: [num_probes, B, D] -> [B, D]
-            x = x.mean(dim=0)
+            x = probes.mean(dim=0)
+            # Return result and probes for diversity loss calculation
+            # Convert probes to [B, num_probes, D] for easier loss calculation
+            probes = probes.permute(1, 0, 2)  # [B, num_probes, D]
+            x = self.ln_post(x)
+            result = self.fc(x)
+            return result, probes
         else:
-            # FAFormer with CLS token: concat in NLD first, then convert to LND
+            # FAFormer with CLS token
             x = x.permute(1, 0, 2)  # [B, 24, D] NLD format
-            cls = self.cls_token.view(1, 1, -1).repeat(B, 1, 1)  # [1, B, D] -> [B, 1, D]
+            cls = self.cls_token.view(1, 1, -1).repeat(B, 1, 1)  # [B, 1, D]
             x = torch.cat([cls, x], dim=1)  # [B, 25, D]
-            x = x.permute(1, 0, 2)  # LND: [25, B, D]
+            x = x.permute(1, 0, 2)  # LND
             out, x = self.transformer(x)
-            x = x.permute(1, 0, 2)  # LND -> NLD: [B, 25, D]
+            x = x.permute(1, 0, 2)  # LND -> NLD
             x = x[:, 0, :]  # Take CLS token
-
-        x = self.ln_post(x)
-        result = self.fc(x)
-        return result
+            x = self.ln_post(x)
+            result = self.fc(x)
+            # Return None for probes in FAFormer mode
+            return result, None
 
 

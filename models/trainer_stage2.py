@@ -3,6 +3,7 @@ import os
 import numpy as np
 from torch.optim import lr_scheduler
 import torch
+import torch.nn as nn
 from sklearn.metrics import accuracy_score, average_precision_score
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
@@ -11,6 +12,39 @@ from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 
 from models.network.net_stage2 import net_stage2
+
+
+def diversity_loss(probes: torch.Tensor):
+    """
+    Compute diversity loss for probes to encourage orthogonality.
+
+    Args:
+        probes: Tensor of shape [B, N, D] where N is number of probes, D is dimension
+
+    Returns:
+        diversity_loss: Scalar loss encouraging probes to be orthogonal
+    """
+    if probes is None:
+        return torch.tensor(0.0, device=probes.device if probes is not None else 'cpu')
+
+    B, N, D = probes.shape
+
+    # L2 normalize probes
+    probes_norm = probes / (probes.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # Compute Gram matrix (pairwise cosine similarity): [B, N, N]
+    gram = torch.bmm(probes_norm, probes_norm.transpose(1, 2))
+
+    # Identity matrix for ideal orthogonal probes
+    identity = torch.eye(N, device=probes.device, dtype=gram.dtype).unsqueeze(0).expand(B, -1, -1)
+
+    # Frobenius norm of difference
+    loss = torch.norm(gram - identity, p='fro')
+
+    # Normalize by batch size and number of probe pairs
+    loss = loss / (B * N)
+
+    return loss
 
 
 class Trainer_stage2:
@@ -29,11 +63,16 @@ class Trainer_stage2:
         self.scheduler = lr_scheduler.StepLR(self.optimizer, step_size=opt.stage2_lr_decay_step, gamma=opt.stage2_lr_decay_factor)
         self.scaler = GradScaler()
 
+        # Diversity loss parameters
+        self.diversity_weight = getattr(opt, 'diversity_weight', 0.1)
+        print(f"Diversity weight: {self.diversity_weight}")
+
         self.best_val_loss = float('inf')
 
     def train_epoch(self, dataloader: DataLoader, criterion):
         total_loss = 0.0
         total_batches = 0
+        total_div_loss = 0.0
 
         running_loss = 0.0
         batch_number = 0
@@ -41,13 +80,19 @@ class Trainer_stage2:
         self.model.to(self.device)
         self.model.train()
 
-        for batch_idx, (data, target) in enumerate(tqdm(dataloader)):
+        for batch_idx, (data, target) in enumerate(tqdm(dataloader, desc="Training")):
             data, target = data.to(self.device), target.to(self.device)
             self.optimizer.zero_grad()
 
             with autocast():
-                output = self.model(data)
-                loss = criterion(output.squeeze(1), target.type(torch.float32))
+                output, probes = self.model(data)
+                cls_loss = criterion(output.squeeze(1), target.type(torch.float32))
+
+                # Compute diversity loss if using dual stream / probeformer
+                div_loss = diversity_loss(probes)
+
+                # Total loss
+                loss = cls_loss + self.diversity_weight * div_loss
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -55,8 +100,12 @@ class Trainer_stage2:
 
             running_loss += loss.item()
             total_loss += loss.item()
+            total_div_loss += div_loss.item()
             batch_number += 1
             total_batches += 1
+
+        avg_div_loss = total_div_loss / (total_batches + 1)
+        print(f"  Div Loss: {avg_div_loss:.6f} (weight: {self.diversity_weight})")
 
         return total_loss / (total_batches + 1)
 
@@ -67,12 +116,12 @@ class Trainer_stage2:
         dataset_preds = []
         dataset_targets = []
 
-        for data, target in tqdm(dataloader):
+        for data, target in tqdm(dataloader, desc="Validating"):
             data, target = data.to(self.device), target.to(self.device)
 
             with torch.no_grad():
                 with autocast():
-                    pre = self.model(data)
+                    pre, _ = self.model(data)
                     loss = criterion(pre.squeeze(1), target.type(torch.float32))
                     running_loss += loss.item()
                     pre_prob = pre.cpu().numpy()

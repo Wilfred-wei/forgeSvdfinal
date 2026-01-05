@@ -99,7 +99,9 @@ if __name__ == '__main__':
                     if opt.eval_stage == 1:
                         pre, _, _ = model(data)
                     else:
-                        pre = model(data)
+                        pre, _ = model(data)
+                        if isinstance(pre, tuple):
+                            pre = pre[0]
 
                     pre_prob = torch.sigmoid(pre).cpu()
                     target = target.cpu()
