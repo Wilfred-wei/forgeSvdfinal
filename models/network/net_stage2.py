@@ -56,9 +56,50 @@ class FAFormer(nn.Module):
             out['layer'+str(idx)] = x[0] # shape:LND. choose cls token feature
         return out, x
 
+
+class ProbeFormer(nn.Module):
+    """Multi-Probe Attention Module for forensics artifact detection.
+
+    Uses N learnable probes to actively probe CLIP layer features,
+    replacing the single CLS token approach.
+    """
+    def __init__(self, width: int, layers: int, heads: int, reduction_factor: int,
+                 num_probes: int = 8, attn_mask: torch.Tensor = None):
+        super().__init__()
+        self.width = width
+        self.num_probes = num_probes
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, reduction_factor, attn_mask) for _ in range(layers)])
+
+        # Initialize learnable probes: [1, num_probes, width]
+        self.probes = nn.Parameter(torch.randn(1, num_probes, width) * 0.02)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: CLIP features, shape [L_clip, B, D] (e.g., [24, Batch, Dim])
+        Returns:
+            x: Probes after transformer interaction, shape [num_probes, B, D]
+        """
+        L, B, D = x.shape
+
+        # 1. Expand Probes: [1, num_probes, D] -> [num_probes, B, D]
+        probes = self.probes.permute(1, 0, 2).repeat(1, B, 1)
+
+        # 2. Concat: [num_probes + L_clip, B, D]
+        x = torch.cat([probes, x], dim=0)
+
+        # 3. Transformer Interaction
+        for layer in self.resblocks:
+            x = layer(x)
+
+        # 4. Return Probes Only: [num_probes, B, D]
+        return x[:self.num_probes]
+
 class net_stage2(nn.Module):
     def __init__(self, opt, dim=768, drop_rate=0.5, output_dim=1, train=True):
         super(net_stage2, self).__init__()
+
+        self.use_probeformer = getattr(opt, 'use_probeformer', False)
 
         self.backbone = net_stage1()
         if train:
@@ -74,8 +115,18 @@ class net_stage2(nn.Module):
                 p.requires_grad = False
         # print(params)
 
-        self.transformer = FAFormer(dim, layers=opt.FAFormer_layers, heads=opt.FAFormer_head, reduction_factor=opt.FAFormer_reduction_factor)
-        self.cls_token = nn.Parameter(torch.zeros([dim]))
+        if self.use_probeformer:
+            print(f"Using ProbeFormer with {opt.num_probes} probes")
+            self.transformer = ProbeFormer(dim, layers=opt.FAFormer_layers, heads=opt.FAFormer_head,
+                                            reduction_factor=opt.FAFormer_reduction_factor,
+                                            num_probes=opt.num_probes)
+            self.cls_token = None  # Not used in ProbeFormer
+        else:
+            print("Using FAFormer with CLS token")
+            self.transformer = FAFormer(dim, layers=opt.FAFormer_layers, heads=opt.FAFormer_head,
+                                         reduction_factor=opt.FAFormer_reduction_factor)
+            self.cls_token = nn.Parameter(torch.zeros([dim]))
+
         self.ln_post = nn.LayerNorm(dim)
 
         self.fc = nn.Sequential(
@@ -86,8 +137,10 @@ class net_stage2(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        # Initialize the cls_token
-        nn.init.normal_(self.cls_token, std=0.02)
+        # Initialize cls_token for FAFormer
+        if self.cls_token is not None:
+            nn.init.normal_(self.cls_token, std=0.02)
+
         for m in self.transformer.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
@@ -108,19 +161,31 @@ class net_stage2(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.size()
-        _, cls_tokens = self.backbone(x)
+        _, cls_tokens, _ = self.backbone(x)
 
-        cls_tokens = torch.stack(cls_tokens, dim=1)
-        cls = self.cls_token.view(1, 1, -1).repeat(B, 1, 1)
-        x = torch.cat([cls, cls_tokens], dim=1)
+        # Each cls_tokens[i] is [L, B, D] (LND format, L=257: 256 patches + 1 CLS)
+        # Extract CLS token (index 0 in sequence): [L, B, D] -> [B, D]
+        cls_tokens = [t[0, :, :] for t in cls_tokens]
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        out, x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        # Stack: [24, B, D]
+        x = torch.stack(cls_tokens, dim=0)
 
-        x = self.ln_post(x[:, 0, :])
-        #output = x
-        #x = torch.cat([feature, x], dim=1)
+        if self.use_probeformer:
+            # ProbeFormer: x is already [24, B, D] in LND format
+            x = self.transformer(x)
+            # Mean Pooling over probes: [num_probes, B, D] -> [B, D]
+            x = x.mean(dim=0)
+        else:
+            # FAFormer with CLS token: concat in NLD first, then convert to LND
+            x = x.permute(1, 0, 2)  # [B, 24, D] NLD format
+            cls = self.cls_token.view(1, 1, -1).repeat(B, 1, 1)  # [1, B, D] -> [B, 1, D]
+            x = torch.cat([cls, x], dim=1)  # [B, 25, D]
+            x = x.permute(1, 0, 2)  # LND: [25, B, D]
+            out, x = self.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD: [B, 25, D]
+            x = x[:, 0, :]  # Take CLS token
+
+        x = self.ln_post(x)
         result = self.fc(x)
         return result
 

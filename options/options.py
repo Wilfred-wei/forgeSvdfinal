@@ -44,6 +44,10 @@ class Options():
         parser.add_argument('--FAFormer_layers', type=int, default=2)
         parser.add_argument('--FAFormer_reduction_factor', type=int, default=1)
         parser.add_argument('--FAFormer_head', type=int, default=2)
+        parser.add_argument('--use_probeformer', action='store_true', default=False,
+                            help='Use ProbeFormer instead of FAFormer (default: False)')
+        parser.add_argument('--num_probes', type=int, default=8,
+                            help='Number of probes for ProbeFormer mechanism')
 
         # evaluation setting
         parser.add_argument('--eval_stage', type=int, default=1,
